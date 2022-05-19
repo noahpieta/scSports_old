@@ -1,0 +1,163 @@
+__doc__ = """\n
+
+      """
+shell.executable("/bin/bash")
+## unofficial bash strict mode
+shell.prefix("source ~/.bashrc; set -euo pipefail;")
+ADAPTER = {"a":"TGTCTCTTATACACATCT", "A":"TGTCTCTTATACACATCT"}
+INTERADAPTER = {"g":"AAGCAGTGGTATCAACGCAGAGTACATGGG","a":"GTACTCTGCGTTGATACCAGTGCTT","G":"AAGCAGTGGTATCAACGCAGAGTACATGGG","A":"GTACTCTGCGTTGATACCAGTGCTT"}
+
+#PYTHON="/mnt/projects/zhangyu2/projects/miniconda3/envs/mixture/bin/python"
+CUTADAPT = "/mnt/software/bin/cutadapt"
+BOWTIE2 = "/mnt/software/bin/bowtie2"
+BEDTOOLS = "/mnt/software/bin/bedtools"
+SAMTOOLS = "/mnt/projects/zhangyu2/projects/miniconda3/envs/mixture/bin/samtools"
+BAMREADCOUNT = "/mnt/projects/zhangyu2/projects/bin/bam-readcount"
+FEATURECOUNT = "/mnt/projects/zhangyu2/projects/bin/featureCounts"
+GETMUTRATE = "/mnt/projects/zhangyu2/projects/single-cell_shapemap/scripts/get_mutrate.v3.5.py"
+FILTERMUTRATE = "/mnt/projects/zhangyu2/projects/single-cell_shapemap/scripts/filter_mutrate.py"
+## reference
+RRNA_BOWTIE2_INDEX="/mnt/projects/zhangyu2/projects/ref/hg19_rrna/human_rrna"
+HOMO_BOWTIE2_INDEX="/mnt/projects/zhangyu2/projects/ref/Gencode_GRCh38.longest_transcriptome/gencode.v36.longestCDS.rRNA.fa"
+RRNA_BOWTIE2_FA="/mnt/projects/zhangyu2/projects/ref/hg19_rrna/human_rrna.fa"
+HOMO_BOWTIE2_FA="/mnt/projects/zhangyu2/projects/ref/Gencode_GRCh38.longest_transcriptome/gencode.v36.longestCDS.rRNA.fa"
+HOMO_SAF = "/mnt/projects/zhangyu2/projects/ref/Gencode_GRCh38.longest_transcriptome/gencode.v36.longestCDS.rRNA.saf"
+
+#HOMO_BOWTIE2_INDEX = "/mnt/projects/zhangyu2/projects/ref/Homo_sapiens.GRCh38.98/Homo_sapiens.GRCh38.98.gene.longest_transcripts"
+#HOMO_BOWTIE2_FA = "/mnt/projects/zhangyu2/projects/ref/Homo_sapiens.GRCh38.98/Homo_sapiens.GRCh38.98.gene.longest_transcripts.fa"
+#HOMO_SAF = "/mnt/projects/zhangyu2/projects/ref/Homo_sapiens.GRCh38.98/Homo_sapiens.GRCh38.98.gene.longest_transcripts.saf"
+
+def get_id():
+    import os
+    import glob
+    fqi = glob.glob("R*.R1.fastq.gz")[0]
+    id = os.path.abspath(fqi).split('/')[-1].split(".")[0]
+    return id
+ID = get_id()
+# fetch fastq
+def get_fq(r):
+    import glob
+    #print (glob.glob("R*_R{}_001.fastq.gz".format(r)))
+    #return glob.glob("R*_R{}.fastq.gz".format(r))
+    return glob.glob("R*.R{}*.fastq.gz".format(r))
+
+def get_non_rRNA_fq(prefix, r):
+    l = prefix.split(".")
+    l.insert(2, str(r))
+    out = ".".join(l)
+    print (out)
+    return out
+
+## IGNORE THE ADAPTER TRIMMING
+rule all:
+    input:
+        "{}.mutrate.txt.gz".format(ID),
+        "{}.filter_mapq.bam.bai".format(ID),
+        "{}.mutrate.filter.gz".format(ID),
+
+rule bowtie_map_to_transcriptome:
+    input:
+        fqi = get_fq(1),
+        fqj = get_fq(2),
+        bowtie_index = HOMO_BOWTIE2_INDEX
+    output:
+        bam="{ID}.transcriptome.bam",
+    params: k=20, R=5,
+    shell:"""
+        {BOWTIE2} --quiet -R {params.R} -p 4 -x {input.bowtie_index} \
+        -1 {input.fqi} -2 {input.fqj} | \
+        {SAMTOOLS} view -@ 2 -bS | {SAMTOOLS} sort -@ 2 -o {output.bam}
+        """
+
+rule filter_bam_by_mapq:
+    input:
+        bam = rules.bowtie_map_to_transcriptome.output.bam
+    output:
+        bam = "{ID}.filter_mapq.bam"
+    shell:"""
+        {SAMTOOLS} view -@ 2 -b -q 10 -o {output.bam} {input.bam}
+        """
+
+rule bam_idx:
+    input:
+        bam2 = rules.filter_bam_by_mapq.output.bam
+    output:
+        bai2 = "{ID}.filter_mapq.bam.bai",
+    shell:"""
+        {SAMTOOLS} index {input.bam2} {output.bai2};
+        """
+
+rule calculate_md:
+    input:
+        bam = rules.filter_bam_by_mapq.output.bam,
+        reffa = HOMO_BOWTIE2_FA
+    output:
+        mdbam = temp("{ID}.transcriptome.md.bam")
+    params:
+        T=8
+    shell:
+        """
+        {SAMTOOLS} fillmd -@ {params.T} -euArE {input.bam} {input.reffa} > {output.mdbam}
+        """
+
+rule mdbam_idx:
+    input:
+        bam2 = rules.calculate_md.output.mdbam
+    output:
+        bai2 = "{ID}.transcriptome.md.bam.bai",
+    shell:"""
+        {SAMTOOLS} index {input.bam2} {output.bai2};
+        """
+
+rule bam_readcount:
+    input:
+        bam = rules.calculate_md.output.mdbam,
+        reffa = HOMO_BOWTIE2_FA
+    output:
+        pos_count = "{ID}.bam_readcount.txt.gz"
+    shell:
+        """
+        {BAMREADCOUNT} -w 0 -f {input.reffa} {input.bam} | gzip -c > {output.pos_count}
+        """
+
+rule featurecount:
+    input:
+        bam = rules.filter_bam_by_mapq.output.bam,
+        annotation = HOMO_SAF
+    output:
+        fcout = "{ID}.featurecount"
+    params:
+        T=8,
+        F='SAF'
+    shell:
+        """
+        {FEATURECOUNT} -M -d 20 -D 10000 -T {params.T} -F {params.F} \
+        -a {input.annotation} -o {output.fcout} {input.bam}
+        """
+
+rule calculate_mutrate:
+    input:
+        pos_count = rules.bam_readcount.output.pos_count,
+        fc = rules.featurecount.output.fcout
+    output:
+        out_gzip = "{ID}.mutrate.txt.gz"
+    params:
+        win_len = 0.05, ## -w {params.win_len}
+        gene_output_cov_threshold = 30
+    shell:
+        """
+        {GETMUTRATE} -i {input.pos_count} -e  {input.fc} -o {output.out_gzip} \
+        -d each_gene  -gc {params.gene_output_cov_threshold}
+        """
+
+rule filter_by_cov:
+    input:
+        mutrate = rules.calculate_mutrate.output.out_gzip,
+    output:
+        filtered_mutrate = "{ID}.mutrate.filter.gz",
+    params:
+        cov_threshold=1,
+        type="ncov"
+    shell:"""
+        {FILTERMUTRATE} -i {input.mutrate} -o {output.filtered_mutrate} -c {params.cov_threshold} -t {params.type}
+        """
